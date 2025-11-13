@@ -141,6 +141,8 @@ def load_data():
     data["total_sales"] = normalize_total_sales(raw.get("total_sales", 0.0))
     data["free_orders"] = normalize_free_orders(raw.get("free_orders", {}))
     data["processed_payments"] = normalize_processed_payments(raw.get("processed_payments", []))
+    # vpn_prices persistence support with fallback default
+    data["vpn_prices"] = raw.get("vpn_prices") or {}
 
     data.setdefault("products", {})
     data.setdefault("balances", {})
@@ -150,6 +152,7 @@ def load_data():
     data.setdefault("total_sales", 0.0)
     data.setdefault("free_orders", {})
     data.setdefault("processed_payments", [])
+    data.setdefault("vpn_prices", {})
     return data
 
 def save_data(d):
@@ -162,6 +165,7 @@ def save_data(d):
         "total_sales": normalize_total_sales(d.get("total_sales", 0.0)),
         "free_orders": normalize_free_orders(d.get("free_orders", {})),
         "processed_payments": normalize_processed_payments(processed_payments),
+        "vpn_prices": d.get("vpn_prices", {}),
     }
 
     temp_fd, temp_path = tempfile.mkstemp(dir=BASE_DIR, prefix="bot_data.", suffix=".tmp")
@@ -197,7 +201,7 @@ print("Total stock items:", sum(len(v) for v in products.values()))
 DATA_REPORT_INTERVAL_SECONDS = 3600
 
 # Updated vpn_prices structure based on your provided list
-vpn_prices = {
+default_vpn_prices = {
     "Express VPN": {"price": 30, "days": 7},
     "Nord VPN": {"price": 40, "days": 7},
     "PIA VPN": {"price": 30, "days": 7},
@@ -215,8 +219,11 @@ vpn_prices = {
     "Potato VPN": {"price": 30, "days": 7},
     "Zoog VPN": {"price": 15, "days": 3}
 }
+# Load persisted vpn_prices or fallback to default
+vpn_prices = data.get("vpn_prices") or default_vpn_prices.copy()
+data["vpn_prices"] = vpn_prices
 
-# --- NEW: Define expected fields for each VPN type ---
+# --- Define expected fields for each VPN type ---
 # Keys are the exact keys from vpn_prices.
 # Values are lists of required fields in the order they should appear in the input/output.
 product_fields = {
@@ -224,7 +231,6 @@ product_fields = {
     "HMA VPN": ["Activation Key"], # HMA VPN will only have an activation key
     # Default for others (if not specified here, it falls back to a generic Gmail/Password)
 }
-# --- END NEW ---
 
 # Payment gateway number (updated to your specified number)
 PAYMENT_NUMBER = "01739089344" 
@@ -247,7 +253,7 @@ def admin_menu_markup():
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("📊 Total Sales", "📈 Current Stock")
     kb.row("➕ Add VPN Account", "📩 Free Orders")
-    kb.row("⬅️ Main Menu (User)")
+    kb.row("🗑️ Remove VPN Stock", "⬅️ Main Menu (User)")
     return kb
 
 def norm_text(s): return " ".join(s.strip().split()).lower() if isinstance(s, str) else ""
@@ -260,7 +266,8 @@ def admin_command_help():
         "/buyer – মোট ইউজার, বায়ার সংখ্যা ও টপ বায়ার লিস্ট\n"
         "/removebalance <user_id> – নির্দিষ্ট ইউজারের ব্যালেন্স 0 করবে\n"
         "/broadcast – সবার কাছে ম্যাসেজ পাঠাবে\n"
-        "/remind_freeorders – Pending free order ইউজারদের রিমাইন্ডার"
+        "/remind_freeorders – Pending free order ইউজারদের রিমাইন্ডার\n"
+        "/removestock – যেকোনো VPN এর স্টক ডিলিট করুন"
     )
 
 def parse_trx_id(text): 
@@ -502,34 +509,45 @@ def vpn_selected(c):
     days = vpn_info["days"]
     uid = str(c.from_user.id)
     bal = balances.get(uid, 0.0)
-    stock_count = len(products.get(vpn_name, [])) # Stock count for logic, not display to user
+    stock_count = len(products.get(vpn_name, [])) # Stock count for logic
+
+    # Determine max quantity based on balance and stock
+    max_by_balance = int(bal // price) if price > 0 else stock_count
+    max_qty = max(0, min(stock_count, max_by_balance))
+    qty = 1 if max_qty >= 1 else 0
 
     kb = InlineKeyboardMarkup()
     
-    # Message for display
     message_text = (
         f"🛍 *{vpn_name}*\n\n"
         f"*🕒 Duration*:  {days} Days\n"
-        f"\t└ *Price:* *{price}৳*\n"
-        f"\t**Your Balance:** {bal:.2f}৳\n\n"
+        f"\t└ *Unit Price:* *{price}৳*\n"
+        f"\t└ *Your Balance:* {bal:.2f}৳\n\n"
     )
     
-    if stock_count == 0:
-        bot.answer_callback_query(c.id, "দুঃখিত ভাই এই Vpn Stock নেই আপনি চাইলে অর্ডার করে রাখতে পারেন 💗", show_alert=True)
-        message_text += "*🚫দুঃখিত ভাই এই Vpn Stock নেই*\n\nঅর্ডার করে রাখতে পারেন Account করে আপনাকে দেওয়া হবে 💗 "
-        # NEW: Free order request button
-        kb.add(InlineKeyboardButton("📩 Request Order", callback_data=f"freeorder|{vpn_name}"))
-    elif bal < price:
-        bot.answer_callback_query(c.id, "Insufficient balance. Please add funds.", show_alert=True)
-        message_text += "💰 Insufficient balance. Please add funds."
-        kb.add(InlineKeyboardButton("➕ Add Balance", callback_data="add_balance_shortcut")) # Correct emoji
-    else: # Sufficient balance and stock
-        message_text += "Ready to purchase!"
-        kb.add(InlineKeyboardButton("✅ Buy Now", callback_data=f"buy|{vpn_name}"))
-    
-    # Always include Cancel and Back to Main Menu
+    if max_qty == 0:
+        if stock_count == 0:
+            bot.answer_callback_query(c.id, "দুঃখিত ভাই এই Vpn Stock নেই আপনি চাইলে অর্ডার করে রাখতে পারেন 💗", show_alert=True)
+            message_text += "*🚫দুঃখিত ভাই এই Vpn Stock নেই*\n\nঅর্ডার করে রাখতে পারেন Account করে আপনাকে দেওয়া হবে 💗 "
+            kb.add(InlineKeyboardButton("📩 Request Order", callback_data=f"freeorder|{vpn_name}"))
+        else:
+            bot.answer_callback_query(c.id, "Insufficient balance. Please add funds.", show_alert=True)
+            message_text += "💰 Insufficient balance. Please add funds."
+            kb.add(InlineKeyboardButton("➕ Add Balance", callback_data="add_balance_shortcut"))
+    else:
+        # Quantity selector row: - [qty] +
+        kb.row(
+            InlineKeyboardButton("➖", callback_data=f"decqty|{vpn_name}|{qty}"),
+            InlineKeyboardButton(f"Qty: {qty}", callback_data="noop"),
+            InlineKeyboardButton("➕", callback_data=f"incqty|{vpn_name}|{qty}")
+        )
+        total = price * qty
+        message_text += f"*Select Quantity* (max {max_qty})\n\n"
+        message_text += f"Subtotal: {total}৳\n"
+        kb.add(InlineKeyboardButton("✅ Buy Now", callback_data=f"buyqty|{vpn_name}|{qty}|{max_qty}"))
+
     kb.add(InlineKeyboardButton("❌ Cancel", callback_data="cancel_vpn_selection"))
-    kb.add(InlineKeyboardButton("🏠 Main Menu", callback_data="back_to_main_menu")) # Correct emoji
+    kb.add(InlineKeyboardButton("🏠 Main Menu", callback_data="back_to_main_menu"))
     
     try:
         bot.edit_message_text(message_text, c.message.chat.id, c.message.message_id, reply_markup=kb, parse_mode="Markdown")
@@ -537,19 +555,150 @@ def vpn_selected(c):
         log(f"edit_message_text failed: {e}")
         bot.edit_message_text("Select an option:", c.message.chat.id, c.message.message_id, reply_markup=kb)
 
-@bot.callback_query_handler(func=lambda c: c.data == "cancel_vpn_selection")
-def cancel_vpn_selection(c):
-    bot.edit_message_text("Selection cancelled. Returning to main menu.", c.message.chat.id, c.message.message_id)
-    bot.send_message(c.message.chat.id, "Choose an option:", reply_markup=main_menu_markup())
-    bot.answer_callback_query(c.id, "Cancelled.")
+def _render_qty_view(chat_id, msg_id, vpn_name, qty, max_qty):
+    vpn_info = vpn_prices.get(vpn_name, {})
+    price = vpn_info.get("price", 0)
+    days = vpn_info.get("days", 0)
 
-@bot.callback_query_handler(func=lambda c: c.data == "back_to_main_menu")
-def back_to_main_menu_callback(c):
-    bot.edit_message_text("Returning to main menu.", c.message.chat.id, c.message.message_id)
-    bot.send_message(c.message.chat.id, "Choose an option:", reply_markup=main_menu_markup())
-    bot.answer_callback_query(c.id, "Back to main menu.")
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        InlineKeyboardButton("➖", callback_data=f"decqty|{vpn_name}|{qty}"),
+        InlineKeyboardButton(f"Qty: {qty}", callback_data="noop"),
+        InlineKeyboardButton("➕", callback_data=f"incqty|{vpn_name}|{qty}")
+    )
+    kb.add(InlineKeyboardButton("✅ Buy Now", callback_data=f"buyqty|{vpn_name}|{qty}|{max_qty}"))
+    kb.add(InlineKeyboardButton("❌ Cancel", callback_data="cancel_vpn_selection"))
+    kb.add(InlineKeyboardButton("🏠 Main Menu", callback_data="back_to_main_menu"))
 
-# ========== BUY NOW HANDLER ==========
+    subtotal = price * qty
+    text = (
+        f"🛍 *{vpn_name}*\n\n"
+        f"*🕒 Duration*: {days} Days\n"
+        f"*Unit Price*: {price}৳\n"
+        f"*Quantity*: {qty} (max {max_qty})\n"
+        f"*Subtotal*: {subtotal}৳"
+    )
+    try:
+        bot.edit_message_text(text, chat_id, msg_id, reply_markup=kb, parse_mode="Markdown")
+    except Exception as e:
+        log(f"_render_qty_view fail: {e}")
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("incqty|") or c.data.startswith("decqty|"))
+def change_qty(c):
+    parts = c.data.split("|")
+    action = parts[0]
+    vpn_name = parts[1]
+    try:
+        current_qty = int(parts[2])
+    except Exception:
+        current_qty = 1
+
+    vpn_info = vpn_prices.get(vpn_name)
+    if not vpn_info:
+        bot.answer_callback_query(c.id, "VPN not found.", show_alert=True)
+        return
+
+    uid = str(c.from_user.id)
+    bal = balances.get(uid, 0.0)
+    price = vpn_info["price"]
+    stock_count = len(products.get(vpn_name, []))
+    max_by_balance = int(bal // price) if price > 0 else stock_count
+    max_qty = max(0, min(stock_count, max_by_balance))
+
+    if max_qty == 0:
+        bot.answer_callback_query(c.id, "Not available.", show_alert=True)
+        return
+
+    if action == "incqty":
+        new_qty = min(current_qty + 1, max_qty)
+    else:
+        new_qty = max(1, current_qty - 1)
+
+    _render_qty_view(c.message.chat.id, c.message.message_id, vpn_name, new_qty, max_qty)
+    bot.answer_callback_query(c.id)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("buyqty|"))
+def process_buyqty(c):
+    log(f"callback process_buyqty data={c.data} from={c.from_user.id}")
+    _, vpn_name, qty_str, max_str = c.data.split("|", 3)
+    try:
+        qty = int(qty_str)
+        max_qty = int(max_str)
+    except Exception:
+        bot.answer_callback_query(c.id, "Invalid quantity.", show_alert=True)
+        return
+
+    vpn_info = vpn_prices.get(vpn_name)
+    if not vpn_info:
+        bot.answer_callback_query(c.id, "❌ VPN not found.", show_alert=True)
+        return
+
+    uid = str(c.from_user.id)
+    bal = balances.get(uid, 0.0)
+    price = vpn_info["price"]
+
+    stock_list = products.get(vpn_name, [])
+    stock_available = len(stock_list)
+    max_by_balance = int(bal // price) if price > 0 else stock_available
+    max_allowed = max(0, min(stock_available, max_by_balance))
+
+    if qty < 1 or qty > max_allowed:
+        bot.answer_callback_query(c.id, "Quantity not available. Please adjust.", show_alert=True)
+        _render_qty_view(c.message.chat.id, c.message.message_id, vpn_name, max(1, min(qty, max_allowed or 1)), max_allowed)
+        return
+
+    total_price = price * qty
+    balances[uid] = round(bal - total_price, 2)
+
+    delivered_items = []
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    for _ in range(qty):
+        if not stock_list:
+            break
+        item = stock_list.pop(0)
+        delivered_items.append(item)
+        orders.setdefault(uid, []).append({
+            "vpn_name": vpn_name,
+            "item": item,
+            "timestamp": ts
+        })
+
+    # Update totals
+    global total_sales
+    total_sales += price * len(delivered_items)
+
+    # Persist
+    data["balances"], data["products"], data["orders"], data["total_sales"] = balances, products, orders, total_sales
+    save_data(data)
+
+    # Build summary delivery message
+    fields_to_display = product_fields.get(vpn_name, ["Gmail", "Password"])
+    header = f"🛍 *{vpn_name}* {vpn_info['days']} Days ✅\n\n"
+    summary = [header]
+    for idx, item in enumerate(delivered_items, start=1):
+        summary.append(f"— Account {idx} —")
+        for field in fields_to_display:
+            key = field.lower().replace(" ", "_")
+            summary.append(f"*{field}* ➡ `{item.get(key, 'N/A')}`")
+        summary.append("")
+    delivered_msg = "\n".join(summary).strip()
+
+    try:
+        bot.edit_message_text(delivered_msg, c.message.chat.id, c.message.message_id, parse_mode="Markdown")
+    except Exception as e:
+        log(f"delivery edit_message_text failed: {e}")
+        bot.edit_message_text(f"{vpn_name} delivered.", c.message.chat.id, c.message.message_id)
+    bot.send_message(c.message.chat.id, "⬅️ Back to menu:", reply_markup=main_menu_markup())
+
+    bot.send_message(
+        ADMIN_ID,
+        f"🛒 New Order\nUser: `{uid}`\nVPN: *{vpn_name}*\nQty: {len(delivered_items)}\nTotal: {price*len(delivered_items)}৳",
+        parse_mode="Markdown"
+    )
+
+    bot.answer_callback_query(c.id, "✅ VPN delivered!", show_alert=True)
+
+# ========== BUY NOW HANDLER (legacy single) ==========
 @bot.callback_query_handler(func=lambda c: c.data.startswith("buy|"))
 def process_buy(c):
     log(f"callback process_buy data={c.data} from={c.from_user.id}")
@@ -729,13 +878,12 @@ def show_my_orders(message):
         
         order_list_text += f"*{i+1}. {vpn_name}* (Purchased: {timestamp})\n"
         
-        # --- MODIFIED: Display VPN details in orders based on product_fields ---
+        # Display VPN details based on product_fields
         fields_to_display = product_fields.get(vpn_name, ["Gmail", "Password"])
         for field_name in fields_to_display:
             item_key = field_name.replace(" ", "_").lower()
-            order_list_text += f"  *{field_name}:* `{item_details.get(item_key, 'N/A')}`\n\n"
+            order_list_text += f"  *{field_name}:* `{item_details.get(item_key, 'N/A')}`\n"
         order_list_text += "\n"
-        # --- END MODIFIED ---
         
     bot.send_message(message.chat.id, order_list_text, parse_mode="Markdown", reply_markup=main_menu_markup())
 
@@ -1129,7 +1277,7 @@ def admin_selected_vpn_to_add(c):
     prompt_text += (
         f"`{format_example.strip()}`\n\n"
         "👉 আপনি একই ফরম্যাট বারবার লিখে একসাথে একাধিক একাউন্ট যোগ করতে পারবেন।\n"
-        "প্রতিটি একাউন্টের তথ্য আলাদা লাইনে বা ফাঁকা লাইন দিয়ে লিখুন।"
+        "প্রতিটি একাউন্টের তথ্য আলাদা লাইনে বা ফাঁকা লাইন দিয়ে লিখুন."
     )
 
     msg = bot.send_message(c.message.chat.id, prompt_text, parse_mode="Markdown", reply_markup=ForceReply())
@@ -1219,6 +1367,52 @@ def process_add_vpn_account(message, vpn_name):
     added_count = len(stock_list) - before_count
     bot.reply_to(message, f"✅ Successfully added {added_count} account(s) for *{vpn_name}* to stock. Current stock: {len(stock_list)}", parse_mode="Markdown")
     bot.send_message(message.chat.id, "⬅️ Back to Admin Menu:", reply_markup=admin_menu_markup())
+
+# ===== ADMIN: REMOVE VPN STOCK =====
+@bot.message_handler(commands=["removestock"])
+def admin_remove_stock_cmd(message):
+    if str(message.from_user.id) != str(ADMIN_ID):
+        return
+    markup = InlineKeyboardMarkup()
+    for name in sorted(vpn_prices.keys()):
+        count = len(products.get(name, []))
+        markup.add(InlineKeyboardButton(f"{name} ({count})", callback_data=f"admin_remove_vpn|{name}"))
+    bot.send_message(message.chat.id, "Select VPN to remove stock from:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("admin_remove_vpn|"))
+def admin_remove_vpn_cb(c):
+    if str(c.from_user.id) != str(ADMIN_ID):
+        bot.answer_callback_query(c.id, "Unauthorized.", show_alert=True)
+        return
+    vpn_name = c.data.split("|")[1]
+    count = len(products.get(vpn_name, []))
+    msg = bot.send_message(c.message.chat.id, f"Current stock for *{vpn_name}*: {count}\n\nHow many to remove? (send a number)", parse_mode="Markdown", reply_markup=ForceReply())
+    bot.register_next_step_handler(msg, perform_remove_vpn_stock, vpn_name)
+    bot.answer_callback_query(c.id)
+
+def perform_remove_vpn_stock(message, vpn_name):
+    if str(message.from_user.id) != str(ADMIN_ID):
+        return
+    try:
+        n = int((message.text or "0").strip())
+    except Exception:
+        bot.reply_to(message, "❌ Invalid number.")
+        return
+    if n <= 0:
+        bot.reply_to(message, "❌ Number must be positive.")
+        return
+
+    stock_list = products.get(vpn_name, [])
+    to_remove = min(n, len(stock_list))
+    # Remove from the end (most recently added) to avoid interfering with FIFO delivery
+    for _ in range(to_remove):
+        if stock_list:
+            stock_list.pop()
+
+    products[vpn_name] = stock_list
+    data["products"] = products
+    save_data(data)
+    bot.reply_to(message, f"🗑️ Removed {to_remove} stock item(s) from *{vpn_name}*. Now: {len(stock_list)}", parse_mode="Markdown")
 
 # ========== ERROR HANDLER ==========
 
