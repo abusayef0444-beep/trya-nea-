@@ -9,7 +9,7 @@ ADMIN_ID  = 5830499612# আপনার অ্যাডমিন টেলিগ
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE_DIR, "bot_data.json")
 
-BOT_ID = int(BOT_TOKEN.split(":")[0]) # <--- এটিই সঠিক লাইন
+BOT_ID = int(BOT_TOKEN.split(":")[0])  <<--- এটিই সঠিক লাইন
 
 # --- Define the file_id for your general welcome image here ---
 WELCOME_PHOTO_FILE_ID = "AgACAgUAAxkBAANhaP5JbanDLp49uWHygkJdZcpL8P0AAlIMaxvdG_BXlW-fVQWpcPMBAAMCAAN5AAM2BA" # Example file_id, replace with yours!
@@ -156,32 +156,81 @@ def load_data():
     data.setdefault("hidden_vpns", [])
     return data
 
+# ---- Fast, debounced, background disk writer to reduce I/O and speed up bot ----
+class _DataSaver:
+    def __init__(self, path):
+        self.path = path
+        self._lock = threading.Lock()
+        self._pending_payload = None
+        self._event = threading.Event()
+        self._stop = False
+        self._thread = threading.Thread(target=self._worker, name="BotDataSaver", daemon=True)
+        self._thread.start()
+
+    def schedule(self, payload):
+        with self._lock:
+            self._pending_payload = payload
+            self._event.set()
+
+    def flush(self):
+        # Force immediate write of latest payload if any
+        payload = None
+        with self._lock:
+            payload = self._pending_payload
+            self._pending_payload = None
+            self._event.clear()
+        if payload is not None:
+            self._write(payload)
+
+    def _worker(self):
+        # Debounce writes in short window to combine frequent saves
+        while not self._stop:
+            self._event.wait(timeout=0.5)
+            if not self._event.is_set():
+                continue
+            time.sleep(0.5)  # debounce window
+            payload = None
+            with self._lock:
+                payload = self._pending_payload
+                self._pending_payload = None
+                self._event.clear()
+            if payload is not None:
+                self._write(payload)
+
+    def _write(self, payload):
+        temp_fd, temp_path = tempfile.mkstemp(dir=BASE_DIR, prefix="bot_data.", suffix=".tmp")
+        try:
+            with os.fdopen(temp_fd, "w", encoding="utf-8") as tmp_file:
+                json.dump(payload, tmp_file, ensure_ascii=False, indent=2)
+            os.replace(temp_path, self.path)
+        except Exception:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            raise
+
+# Global saver instance
+_DATA_SAVER = _DataSaver(DATA_FILE)
+
 def save_data(d):
+    # Build a lightweight payload without re-normalizing everything each time.
+    # Assumes in-memory structures are already normalized on load and mutation.
     payload = {
-        "products": normalize_products(d.get("products", {})),
-        "balances": normalize_balances(d.get("balances", {})),
-        "pending_payments": normalize_pending_payments(d.get("pending_payments", {})),
-        "unmatched_payments": normalize_unmatched_payments(d.get("unmatched_payments", {})),
-        "orders": normalize_orders(d.get("orders", {})),
-        "total_sales": normalize_total_sales(d.get("total_sales", 0.0)),
-        "free_orders": normalize_free_orders(d.get("free_orders", {})),
-        "processed_payments": normalize_processed_payments(processed_payments),
+        "products": d.get("products", {}),
+        "balances": d.get("balances", {}),
+        "pending_payments": d.get("pending_payments", {}),
+        "unmatched_payments": d.get("unmatched_payments", {}),
+        "orders": d.get("orders", {}),
+        "total_sales": d.get("total_sales", 0.0),
+        "free_orders": d.get("free_orders", {}),
+        "processed_payments": sorted(list(processed_payments)),
         "vpn_prices": d.get("vpn_prices", {}),
         "hidden_vpns": d.get("hidden_vpns", []),
     }
-
-    temp_fd, temp_path = tempfile.mkstemp(dir=BASE_DIR, prefix="bot_data.", suffix=".tmp")
-    try:
-        with os.fdopen(temp_fd, "w", encoding="utf-8") as tmp_file:
-            json.dump(payload, tmp_file, ensure_ascii=False, indent=2)
-        os.replace(temp_path, DATA_FILE)
-    except Exception:
-        try:
-            os.remove(temp_path)
-        except OSError:
-            pass
-        raise
-
+    # Schedule async write (debounced)
+    _DATA_SAVER.schedule(payload)
+    # Keep in-memory reference updated
     d["processed_payments"] = payload["processed_payments"]
 
 data               = load_data()
@@ -237,19 +286,29 @@ def log(msg):
     except:
         pass
 
+# Pre-build and reuse markups to avoid re-allocations
+_MAIN_MENU_KB = None
+_ADMIN_MENU_KB = None
+
 def main_menu_markup():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("🛒 Buy Products", "💰 Add Balance")
-    kb.row("📦 My Orders", "💳 My Balance")
-    return kb
+    global _MAIN_MENU_KB
+    if _MAIN_MENU_KB is None:
+        kb = ReplyKeyboardMarkup(resize_keyboard=True)
+        kb.row("🛒 Buy Products", "💰 Add Balance")
+        kb.row("📦 My Orders", "💳 My Balance")
+        _MAIN_MENU_KB = kb
+    return _MAIN_MENU_KB
 
 def admin_menu_markup():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("📊 Total Sales", "📈 Current Stock")
-    kb.row("➕ Add VPN Account", "📩 Free Orders")
-    kb.row("🗑️ Remove VPN Stock", "🛠 Manage Products")
-    kb.row("⬅️ Main Menu (User)")
-    return kb
+    global _ADMIN_MENU_KB
+    if _ADMIN_MENU_KB is None:
+        kb = ReplyKeyboardMarkup(resize_keyboard=True)
+        kb.row("📊 Total Sales", "📈 Current Stock")
+        kb.row("➕ Add VPN Account", "📩 Free Orders")
+        kb.row("🗑️ Remove VPN Stock", "🛠 Manage Products")
+        kb.row("⬅️ Main Menu (User)")
+        _ADMIN_MENU_KB = kb
+    return _ADMIN_MENU_KB
 
 def norm_text(s): return " ".join(s.strip().split()).lower() if isinstance(s, str) else ""
 def ensure_user(uid): balances.setdefault(uid, 0.0); orders.setdefault(uid, [])
@@ -344,10 +403,14 @@ def generate_data_snapshot_file():
     safe_timestamp = generated_at.replace(" ", "_").replace(":", "-")
     filename = f"bot_data_snapshot_{safe_timestamp}.json"
     file_path = os.path.join(tempfile.gettempdir(), filename)
+
     try:
         save_data(data)
+        # Ensure the latest state is on disk before reading for snapshot
+        _DATA_SAVER.flush()
     except Exception as e:
         log(f"Failed to persist data before snapshot: {e}")
+
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as src:
             contents = src.read()
@@ -357,12 +420,14 @@ def generate_data_snapshot_file():
     except Exception as e:
         log(f"Failed to read DATA_FILE: {e}")
         contents = json.dumps(data, ensure_ascii=False, indent=2)
+
     try:
         with open(file_path, "w", encoding="utf-8") as dst:
             dst.write(contents)
     except Exception as e:
         log(f"Failed to write snapshot file: {e}")
         raise
+
     return file_path, generated_at
 
 def send_bot_data_snapshot(target_chat_id, reason="Scheduled hourly snapshot"):
@@ -1266,5 +1331,7 @@ print("Bot polling...")
 bot.infinity_polling(
     timeout=60,
     long_polling_timeout=20,
-    allowed_updates=["message", "callback_query"]
+    allowed_updates=["message", "callback_query"],
+    skip_pending=True,
+    request_timeout=25
 )
