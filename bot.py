@@ -9,7 +9,9 @@ ADMIN_ID  = 5830499612# আপনার অ্যাডমিন টেলিগ
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE_DIR, "bot_data.json")
 
-BOT_ID = int(BOT_TOKEN.split(":")[0])  <<--- এটিই সঠিক লাইন
+# Derive numeric bot ID from token prefix
+BOT_ID = int(BOT_TOKEN.split(":")_code[0new]</)
+ন
 
 # --- Define the file_id for your general welcome image here ---
 WELCOME_PHOTO_FILE_ID = "AgACAgUAAxkBAANhaP5JbanDLp49uWHygkJdZcpL8P0AAlIMaxvdG_BXlW-fVQWpcPMBAAMCAAN5AAM2BA" # Example file_id, replace with yours!
